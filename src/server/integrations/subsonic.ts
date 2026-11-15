@@ -20,7 +20,7 @@ import { fetchRecommendedSongs } from '@/server/utils/recommendSongs'
 import { filterDisliked, splitSingers, type DislikeRuleSet } from '@/modules/dislike/match'
 import { encodeAlbumRule } from '@/modules/dislike/utils'
 import { normalizeText } from '@/server/utils/songVersion'
-import { buildQueryVariants, toSimplified } from '@/server/utils/zhConvert'
+import { buildQueryVariants, hasTraditionalChars, toSimplified } from '@/server/utils/zhConvert'
 import { getCachedDislikeRuleSet, invalidateDislikeCache } from '@/server/utils/dislikeCache'
 import { proxyCoverImage } from '@/server/media/coverProxy'
 import { subsonicLog } from '@/utils/log4js'
@@ -788,6 +788,8 @@ class SubsonicHandler {
 
     // 固定同一关键词的在线结果顺序，避免客户端翻页时出现重复或跳项。
     private onlineSearchCache = new Map<string, { expiresAt: number, results: { music: LX.Music.MusicInfo, listId: string }[] }>()
+    private onlineArtistSearchCache = new Map<string, { expiresAt: number, results: any[] }>()
+    private onlineAlbumSearchCache = new Map<string, { expiresAt: number, results: any[] }>()
 
     // 当前用户 love 列表歌曲 id 集合缓存，用于歌曲序列化时标记 starred（按用户名隔离，避免并发串号）
     private loveIdSets = new Map<string, Set<string>>()
@@ -4321,7 +4323,8 @@ class SubsonicHandler {
                 }
 
                 // [新增] 简繁变体补搜：原词命中不足时换个字形再搜一轮
-                // （实测「黄霄雲」(繁) 各源合计仅 5 条，「黄霄云」(简) 有 203 条）
+                // （实测「黄霄雲」(繁) 各源合计仅 5 条，「黄霄云」(简) 有 203 条；简体词已有 ≥5 条时不重复补繁体）
+                const variantStopThreshold = hasTraditionalChars(cleanQuery) ? targetLimit : 5
                 for (const kw of buildQueryVariants(cleanQuery)) {
                     const firstRes: any = await withTimeout(
                         Promise.resolve(musicSdk[source].musicSearch.search(kw, 1, pageSize)),
@@ -4353,7 +4356,7 @@ class SubsonicHandler {
                             if (allItems.length >= targetLimit) break
                         }
                     }
-                    if (allItems.length >= targetLimit) break
+                    if (allItems.length >= variantStopThreshold) break
                 }
 
                 for (const item of allItems.slice(0, targetLimit)) {
@@ -4426,9 +4429,14 @@ class SubsonicHandler {
         const max = Math.max(1, Math.min(limit || 20, 50))
         // 跨源合并与否由 singer.sourcePriority 决定：只配了 1 个源时保持单源行为
         const orderedSources = getOrderedSingerSources()
+        const cacheKey = `${query.trim().toLowerCase()}::${sources.join(',')}::${max}::${orderedSources.join(',')}`
+        const cached = this.onlineArtistSearchCache.get(cacheKey)
+        if (cached && cached.expiresAt > Date.now()) return cached.results
+
         const mergeAcrossSources = orderedSources.length > 1
         const sourceRank = new Map<string, number>()
         orderedSources.forEach((s, i) => sourceRank.set(s, i))
+        const variantStopThreshold = hasTraditionalChars(query) ? max : 5
 
         const groups = await Promise.all(sources.map(async (src): Promise<any[]> => {
             const sdk = (musicSdk as any)[src]
@@ -4436,7 +4444,7 @@ class SubsonicHandler {
             const rows: any[] = []
             const seen = new Set<string>()
             try {
-                // [新增] 简繁变体补搜（同歌曲搜索）
+                // [新增] 简繁变体补搜（同歌曲搜索；简体词已有 ≥5 条时不重复补繁体）
                 for (const kw of buildQueryVariants(query)) {
                     const data: any = await withTimeout(sdk.extendSearch.searchSinger(kw, 1, max), 8000)
                     for (const item of (data?.list || [])) {
@@ -4458,7 +4466,7 @@ class SubsonicHandler {
                             _score: this.artistRelevance(query, name),
                         })
                     }
-                    if (rows.length >= max) break
+                    if (rows.length >= variantStopThreshold) break
                 }
             } catch { /* 单源失败忽略 */ }
             return rows
@@ -4495,7 +4503,15 @@ class SubsonicHandler {
             kept = Array.from(byName.values())
         }
 
-        return kept.slice(0, max).map(({ _source, _score, ...rest }) => rest)
+        const result = kept.slice(0, max).map(({ _source, _score, ...rest }) => rest)
+        if (result.length > 0) {
+            if (this.onlineArtistSearchCache.size >= 100) {
+                const firstKey = this.onlineArtistSearchCache.keys().next().value
+                if (firstKey) this.onlineArtistSearchCache.delete(firstKey)
+            }
+            this.onlineArtistSearchCache.set(cacheKey, { expiresAt: Date.now() + 5 * 60 * 1000, results: result })
+        }
+        return result
     }
 
     /**
@@ -4504,13 +4520,18 @@ class SubsonicHandler {
      */
     private async fetchOnlineSearchAlbums(query: string, sources: string[], limit: number): Promise<any[]> {
         const max = Math.max(1, Math.min(limit || 20, 50))
+        const cacheKey = `${query.trim().toLowerCase()}::${sources.join(',')}::${max}`
+        const cached = this.onlineAlbumSearchCache.get(cacheKey)
+        if (cached && cached.expiresAt > Date.now()) return cached.results
+
         const seen = new Set<string>()
+        const variantStopThreshold = hasTraditionalChars(query) ? max : 5
         const groups = await Promise.all(sources.map(async (src): Promise<any[]> => {
             const sdk = (musicSdk as any)[src]
             if (!sdk?.extendSearch?.searchAlbum) return []
             const rows: any[] = []
             try {
-                // [新增] 简繁变体补搜（同歌曲搜索）
+                // [新增] 简繁变体补搜（同歌曲搜索；简体词已有 ≥5 条时不重复补繁体）
                 for (const kw of buildQueryVariants(query)) {
                     const data: any = await withTimeout(sdk.extendSearch.searchAlbum(kw, 1, max), 8000)
                     for (const item of (data?.list || [])) {
@@ -4538,12 +4559,20 @@ class SubsonicHandler {
                             playCount: 0,
                         })
                     }
-                    if (rows.length >= max) break
+                    if (rows.length >= variantStopThreshold) break
                 }
             } catch { /* 单源失败忽略 */ }
             return rows
         }))
-        return interleaveBySource(groups, max)
+        const result = interleaveBySource(groups, max)
+        if (result.length > 0) {
+            if (this.onlineAlbumSearchCache.size >= 100) {
+                const firstKey = this.onlineAlbumSearchCache.keys().next().value
+                if (firstKey) this.onlineAlbumSearchCache.delete(firstKey)
+            }
+            this.onlineAlbumSearchCache.set(cacheKey, { expiresAt: Date.now() + 5 * 60 * 1000, results: result })
+        }
+        return result
     }
 
     private async handleSearch(res: http.ServerResponse, username: string, params: URLSearchParams, format: string, method: string = 'search3') {
@@ -4774,26 +4803,36 @@ class SubsonicHandler {
         const songOffset = parseInt(params.get('songOffset') || '0')
         const requestedSongEnd = Math.max(0, songOffset) + Math.max(0, songCount)
 
-        // 6. 处理在线 API 搜索与模式融合
-        if (cleanQuery && songCount > 0) {
-            if (searchMode === 'force_online') {
-                const onlineResults = await this.fetchOnlineSearchSongs(cleanQuery, targetOnlineSources, requestedSongEnd)
-                matchedSongs = onlineResults
-            } else if (searchMode === 'merge') {
-                const onlineResults = await this.fetchOnlineSearchSongs(cleanQuery, targetOnlineSources, requestedSongEnd)
-                const existingIds = new Set(matchedSongs.map(s => s.music.id))
-                for (const item of onlineResults) {
-                    if (!existingIds.has(item.music.id)) {
-                        matchedSongs.push(item)
-                        existingIds.add(item.music.id)
-                    }
-                }
-            } else if (searchMode === 'fallback') {
-                if (matchedSongs.length < requestedSongEnd) {
-                    const needed = requestedSongEnd - matchedSongs.length
-                    const onlineResults = await this.fetchOnlineSearchSongs(cleanQuery, targetOnlineSources, needed)
+        // 6. 并发执行在线搜索（歌曲 / 歌手 / 专辑同批发出，避免三段串行叠加等待）
+        const needOnlineSongs = Boolean(
+            cleanQuery && songCount > 0 && searchMode !== 'local_only' &&
+            (searchMode !== 'fallback' || matchedSongs.length < requestedSongEnd)
+        )
+        const songFetchLimit = searchMode === 'fallback'
+            ? Math.max(0, requestedSongEnd - matchedSongs.length)
+            : requestedSongEnd
+        const needArtists = Boolean(cleanQuery && searchMode !== 'local_only' && artistCount > 0 && matchedArtists.length < artistOffset + artistCount)
+        const needAlbums = Boolean(cleanQuery && searchMode !== 'local_only' && albumCount > 0 && matchedAlbums.length < albumOffset + albumCount)
+
+        if (needOnlineSongs || needArtists || needAlbums) {
+            const [onlineSongs, onlineArtists, onlineAlbums] = await Promise.all([
+                needOnlineSongs
+                    ? this.fetchOnlineSearchSongs(cleanQuery, targetOnlineSources, songFetchLimit)
+                    : Promise.resolve([] as { music: LX.Music.MusicInfo, listId: string }[]),
+                needArtists
+                    ? this.fetchOnlineSearchArtists(cleanQuery, targetOnlineSources, artistOffset + artistCount)
+                    : Promise.resolve([] as any[]),
+                needAlbums
+                    ? this.fetchOnlineSearchAlbums(cleanQuery, targetOnlineSources, albumOffset + albumCount)
+                    : Promise.resolve([] as any[]),
+            ])
+
+            if (needOnlineSongs) {
+                if (searchMode === 'force_online') {
+                    matchedSongs = onlineSongs
+                } else {
                     const existingIds = new Set(matchedSongs.map(s => s.music.id))
-                    for (const item of onlineResults) {
+                    for (const item of onlineSongs) {
                         if (!existingIds.has(item.music.id)) {
                             matchedSongs.push(item)
                             existingIds.add(item.music.id)
@@ -4801,26 +4840,15 @@ class SubsonicHandler {
                     }
                 }
             }
-        }
 
-        // [新增] 在线歌手/专辑搜索：Subsonic 客户端搜索页有「艺人 / 专辑」两栏，
-        // 此前它们只从本地库取（未收藏时恒为空）。这里在本地区结果不足时并发补在线结果。
-        if (cleanQuery && searchMode !== 'local_only') {
-            const needArtists = artistCount > 0 && matchedArtists.length < artistOffset + artistCount
-            const needAlbums = albumCount > 0 && matchedAlbums.length < albumOffset + albumCount
-            if (needArtists || needAlbums) {
-                const [onlineArtists, onlineAlbums] = await Promise.all([
-                    needArtists
-                        ? this.fetchOnlineSearchArtists(cleanQuery, targetOnlineSources, artistOffset + artistCount)
-                        : Promise.resolve([] as any[]),
-                    needAlbums
-                        ? this.fetchOnlineSearchAlbums(cleanQuery, targetOnlineSources, albumOffset + albumCount)
-                        : Promise.resolve([] as any[]),
-                ])
+            if (needArtists && onlineArtists.length > 0) {
                 const artistIds = new Set(matchedArtists.map((a: any) => a.id))
                 for (const a of onlineArtists) {
                     if (!artistIds.has(a.id)) { matchedArtists.push(a); artistIds.add(a.id) }
                 }
+            }
+
+            if (needAlbums && onlineAlbums.length > 0) {
                 const albumIds = new Set(matchedAlbums.map((a: any) => a.id))
                 for (const a of onlineAlbums) {
                     if (!albumIds.has(a.id)) { matchedAlbums.push(a); albumIds.add(a.id) }
