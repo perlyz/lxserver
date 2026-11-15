@@ -4326,36 +4326,24 @@ class SubsonicHandler {
                 // （实测「黄霄雲」(繁) 各源合计仅 5 条，「黄霄云」(简) 有 203 条；简体词已有 ≥5 条时不重复补繁体）
                 const variantStopThreshold = hasTraditionalChars(cleanQuery) ? targetLimit : 5
                 for (const kw of buildQueryVariants(cleanQuery)) {
-                    const firstRes: any = await withTimeout(
-                        Promise.resolve(musicSdk[source].musicSearch.search(kw, 1, pageSize)),
-                        8000,
-                    )
-                    const firstList = Array.isArray(firstRes?.list) ? firstRes.list : []
-                    if (firstList.length === 0) continue
-
-                    appendItems(firstList)
-                    if (allItems.length >= targetLimit) break
-
-                    // 仅当需要更多页且平台确实还有后续页时，并发拉取第 2..N 页并按页序入池
-                    const reportedAllPage = Number(firstRes?.allPage)
-                    const actualPages = Number.isFinite(reportedAllPage) && reportedAllPage >= 1
-                        ? Math.min(pagesToFetch, Math.floor(reportedAllPage))
-                        : pagesToFetch
-                    if (actualPages > 1) {
-                        const restPages = Array.from({ length: actualPages - 1 }, (_, i) => i + 2)
-                        const restResults = await Promise.all(restPages.map(page =>
-                            withTimeout(
-                                Promise.resolve(musicSdk[source].musicSearch.search(kw, page, pageSize)),
-                                8000,
-                            ).catch(() => null)
-                        ))
-                        for (const resPage of restResults) {
-                            const list = Array.isArray((resPage as any)?.list) ? (resPage as any).list : []
-                            if (list.length === 0) continue
-                            appendItems(list)
-                            if (allItems.length >= targetLimit) break
-                        }
+                    let firstPageErr: any = null
+                    const pages = Array.from({ length: pagesToFetch }, (_, i) => i + 1)
+                    const pageResults = await Promise.all(pages.map(page =>
+                        withTimeout(
+                            Promise.resolve(musicSdk[source].musicSearch.search(kw, page, pageSize)),
+                            8000,
+                        ).catch(err => {
+                            if (!firstPageErr) firstPageErr = err
+                            return null
+                        })
+                    ))
+                    for (const resPage of pageResults) {
+                        const list = Array.isArray((resPage as any)?.list) ? (resPage as any).list : []
+                        if (list.length === 0) continue
+                        appendItems(list)
+                        if (allItems.length >= targetLimit) break
                     }
+                    if (allItems.length === 0 && firstPageErr) throw firstPageErr
                     if (allItems.length >= variantStopThreshold) break
                 }
 
