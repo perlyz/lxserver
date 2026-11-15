@@ -4418,8 +4418,18 @@ class SubsonicHandler {
         // 跨源合并与否由 singer.sourcePriority 决定：只配了 1 个源时保持单源行为
         const orderedSources = getOrderedSingerSources()
         const cacheKey = `${query.trim().toLowerCase()}::${sources.join(',')}::${max}::${orderedSources.join(',')}`
+        const warmArtistCoverCache = (list: any[]) => {
+            for (const a of list) {
+                if (a?.id && typeof a.artistImageUrl === 'string' && /^https?:/i.test(a.artistImageUrl)) {
+                    this.setSongPicUrl(a.id, a.artistImageUrl)
+                }
+            }
+        }
         const cached = this.onlineArtistSearchCache.get(cacheKey)
-        if (cached && cached.expiresAt > Date.now()) return cached.results
+        if (cached && cached.expiresAt > Date.now()) {
+            warmArtistCoverCache(cached.results)
+            return cached.results
+        }
 
         const mergeAcrossSources = orderedSources.length > 1
         const sourceRank = new Map<string, number>()
@@ -4492,6 +4502,7 @@ class SubsonicHandler {
         }
 
         const result = kept.slice(0, max).map(({ _source, _score, ...rest }) => rest)
+        warmArtistCoverCache(result)
         if (result.length > 0) {
             if (this.onlineArtistSearchCache.size >= 100) {
                 const firstKey = this.onlineArtistSearchCache.keys().next().value
@@ -4509,8 +4520,18 @@ class SubsonicHandler {
     private async fetchOnlineSearchAlbums(query: string, sources: string[], limit: number): Promise<any[]> {
         const max = Math.max(1, Math.min(limit || 20, 50))
         const cacheKey = `${query.trim().toLowerCase()}::${sources.join(',')}::${max}`
+        const warmAlbumCoverCache = (list: any[]) => {
+            for (const a of list) {
+                if (a?.id && typeof a.coverArt === 'string' && /^https?:/i.test(a.coverArt)) {
+                    this.setSongPicUrl(a.id, a.coverArt)
+                }
+            }
+        }
         const cached = this.onlineAlbumSearchCache.get(cacheKey)
-        if (cached && cached.expiresAt > Date.now()) return cached.results
+        if (cached && cached.expiresAt > Date.now()) {
+            warmAlbumCoverCache(cached.results)
+            return cached.results
+        }
 
         const seen = new Set<string>()
         const variantStopThreshold = hasTraditionalChars(query) ? max : 5
@@ -4553,6 +4574,7 @@ class SubsonicHandler {
             return rows
         }))
         const result = interleaveBySource(groups, max)
+        warmAlbumCoverCache(result)
         if (result.length > 0) {
             if (this.onlineAlbumSearchCache.size >= 100) {
                 const firstKey = this.onlineAlbumSearchCache.keys().next().value
