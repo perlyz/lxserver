@@ -4290,34 +4290,68 @@ class SubsonicHandler {
         const sourceResults = new Map<string, { music: LX.Music.MusicInfo, listId: string }[]>()
         // 每个平台一次取足上限，后续 songOffset 分页复用同一批稳定结果。
         const targetLimit = 50
+        // 各源单页安全上限（依据各 musicSearch.js 实测特性）：
+        // - wy 接口硬锁 20 条/页；tx 上限 60；kw/kg 上限 200（浅翻取 100 足够）；mg 传 50 一次返 ~174 条
+        // - 其余未来新源自动回落到自身 musicSearch.limit
+        const SOURCE_PAGE_CAP: Record<string, number> = {
+            wy: 20,
+            tx: 60,
+            kw: 200,
+            kg: 100,
+            mg: 50,
+        }
 
         await Promise.all(validSources.map(async source => {
             const results: { music: LX.Music.MusicInfo, listId: string }[] = []
             sourceResults.set(source, results)
             try {
-                // 计算需要的页数 (网易云 wy 单页限制 20 条，如需要 50 条则自动抓取前 3 页)
-                const pageSize = source === 'kg' ? Math.min(targetLimit, 100) : source === 'wy' ? 20 : 30
+                const maxPerPage = SOURCE_PAGE_CAP[source] ?? (Number(musicSdk[source]?.musicSearch?.limit) || 20)
+                const pageSize = Math.min(targetLimit, maxPerPage)
                 const pagesToFetch = Math.min(Math.ceil(targetLimit / pageSize), 3) // 最多自动抓取前 3 页
 
                 const allItems: any[] = []
                 const existingIds = new Set<string>()
+                const appendItems = (list: any[]) => {
+                    for (const item of list) {
+                        const songmid = String(item.songmid || item.id || '')
+                        if (!songmid || existingIds.has(songmid)) continue
+                        existingIds.add(songmid)
+                        allItems.push(item)
+                    }
+                }
 
                 // [新增] 简繁变体补搜：原词命中不足时换个字形再搜一轮
                 // （实测「黄霄雲」(繁) 各源合计仅 5 条，「黄霄云」(简) 有 203 条）
                 for (const kw of buildQueryVariants(cleanQuery)) {
-                    for (let page = 1; page <= pagesToFetch; page++) {
-                        const searchRes = await musicSdk[source].musicSearch.search(kw, page, pageSize)
-                        const list = Array.isArray(searchRes?.list) ? searchRes.list : []
-                        if (list.length === 0) break
+                    const firstRes: any = await withTimeout(
+                        Promise.resolve(musicSdk[source].musicSearch.search(kw, 1, pageSize)),
+                        8000,
+                    )
+                    const firstList = Array.isArray(firstRes?.list) ? firstRes.list : []
+                    if (firstList.length === 0) continue
 
-                        for (const item of list) {
-                            const songmid = String(item.songmid || item.id || '')
-                            if (!songmid || existingIds.has(songmid)) continue
-                            existingIds.add(songmid)
-                            allItems.push(item)
+                    appendItems(firstList)
+                    if (allItems.length >= targetLimit) break
+
+                    // 仅当需要更多页且平台确实还有后续页时，并发拉取第 2..N 页并按页序入池
+                    const reportedAllPage = Number(firstRes?.allPage)
+                    const actualPages = Number.isFinite(reportedAllPage) && reportedAllPage >= 1
+                        ? Math.min(pagesToFetch, Math.floor(reportedAllPage))
+                        : pagesToFetch
+                    if (actualPages > 1) {
+                        const restPages = Array.from({ length: actualPages - 1 }, (_, i) => i + 2)
+                        const restResults = await Promise.all(restPages.map(page =>
+                            withTimeout(
+                                Promise.resolve(musicSdk[source].musicSearch.search(kw, page, pageSize)),
+                                8000,
+                            ).catch(() => null)
+                        ))
+                        for (const resPage of restResults) {
+                            const list = Array.isArray((resPage as any)?.list) ? (resPage as any).list : []
+                            if (list.length === 0) continue
+                            appendItems(list)
+                            if (allItems.length >= targetLimit) break
                         }
-
-                        if (allItems.length >= targetLimit) break
                     }
                     if (allItems.length >= targetLimit) break
                 }
