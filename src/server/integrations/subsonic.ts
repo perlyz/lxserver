@@ -4348,31 +4348,7 @@ class SubsonicHandler {
                 }
 
                 for (const item of allItems.slice(0, targetLimit)) {
-                    const songmid = String(item.songmid || item.id || '')
-                    const id = `${source}_${songmid}`
-                    const hash = item.hash || item.meta?.hash || item.types?.[0]?.hash || ''
-                    const music: LX.Music.MusicInfo = {
-                        id,
-                        name: item.name,
-                        singer: item.singer,
-                        source: source,
-                        songmid: songmid,
-                        hash: hash,
-                        interval: item.interval || '0',
-                        _interval: item._interval || item.interval || '0',
-                        img: item.img,
-                        types: item.types || item._types || [],
-                        _types: item._types || item.types || {},
-                        meta: {
-                            ...(item.meta || {}),
-                            hash: hash,
-                            picUrl: item.img,
-                            albumName: item.albumName || item.name,
-                            albumId: item.albumId,
-                            qualitys: item.types || item._types || [],
-                            _types: item._types || item.types || {},
-                        },
-                    } as any
+                    const music = this.buildOnlineMusicInfo(source, item)
                     this.cacheOnlineSong(music)
                     results.push({ music, listId: 'online' })
                 }
@@ -6131,6 +6107,52 @@ class SubsonicHandler {
         return promise
     }
 
+    /** 规范化在线搜索 SDK 条目为 MusicInfo，保留各音源解析所需的原生标识字段（copyrightId / strMediaMid / hash 等） */
+    private buildOnlineMusicInfo(source: string, item: any): LX.Music.MusicInfo {
+        const songmid = String(item?.songmid || item?.id || '')
+        const id = `${source}_${songmid}`
+        const hash = item?.hash || item?.meta?.hash || item?.types?.[0]?.hash || ''
+        const copyrightId = item?.copyrightId || item?.meta?.copyrightId || ''
+        const strMediaMid = item?.strMediaMid || item?.meta?.strMediaMid || ''
+        const songId = item?.songId || item?.meta?.songId || songmid
+        const albumMid = item?.albumMid || item?.meta?.albumMid || ''
+        const albumId = item?.albumId || item?.meta?.albumId || ''
+        const albumAudioId = item?.albumAudioId || item?.meta?.albumAudioId || ''
+
+        return {
+            id,
+            name: item?.name,
+            singer: item?.singer,
+            source,
+            songmid,
+            hash,
+            ...(copyrightId ? { copyrightId } : {}),
+            ...(strMediaMid ? { strMediaMid } : {}),
+            ...(songId ? { songId } : {}),
+            ...(albumMid ? { albumMid } : {}),
+            ...(albumAudioId ? { albumAudioId } : {}),
+            interval: item?.interval || '0',
+            _interval: item?._interval || item?.interval || '0',
+            img: item?.img,
+            types: item?.types || item?._types || [],
+            _types: item?._types || item?.types || {},
+            meta: {
+                ...(item?.meta || {}),
+                songId,
+                hash,
+                ...(copyrightId ? { copyrightId } : {}),
+                ...(strMediaMid ? { strMediaMid } : {}),
+                ...(albumMid ? { albumMid } : {}),
+                ...(albumAudioId ? { albumAudioId } : {}),
+                picUrl: item?.img,
+                albumName: item?.albumName || item?.name,
+                albumId,
+                qualitys: item?.types || item?._types || [],
+                _types: item?._types || item?.types || {},
+            },
+        } as any
+    }
+
     private async _resolveStreamUrl(
         source: string,
         songmid: string,
@@ -6143,7 +6165,10 @@ class SubsonicHandler {
         const cfg = global.lx.config
         // 总开关关闭 → 退化为单次解析（服务端硬策略，客户端无法 override 打开）
         if (cfg['subsonic.quality.enabled'] === false) {
-            const r = await callUserApiGetMusicUrl(source as any, musicInfo as any, requestedQuality, username)
+            const r = await withTimeout(
+                callUserApiGetMusicUrl(source as any, musicInfo as any, requestedQuality, username),
+                8000,
+            )
             if (!r?.url) throw new Error('Could not resolve music URL')
             return { url: r.url, quality: r.type || requestedQuality }
         }
@@ -6166,12 +6191,15 @@ class SubsonicHandler {
 
         sourceLoop:
         for (const trySource of sourcesToTry) {
-            // 如果已超时且有 fallback 直链，提前熔断返回 fallback
-            if (fallbackResult && Date.now() >= resolveDeadline) {
-                if (cfg['subsonic.enableDebug']) {
-                    subsonicLog.debug(`[Subsonic] resolve deadline reached; fast fallback to timeout URL: ${fallbackResult.quality} -> ${String(fallbackResult.url).slice(0, 80)}`)
+            // 超时立即熔断：有备选直链直接返回，无备选则不再继续发新的跨平台请求
+            if (Date.now() >= resolveDeadline) {
+                if (fallbackResult) {
+                    if (cfg['subsonic.enableDebug']) {
+                        subsonicLog.debug(`[Subsonic] resolve deadline reached; fast fallback to timeout URL: ${fallbackResult.quality} -> ${String(fallbackResult.url).slice(0, 80)}`)
+                    }
+                    return fallbackResult
                 }
-                return fallbackResult
+                break
             }
 
             const excludeApiSources: string[] = []
@@ -6187,35 +6215,31 @@ class SubsonicHandler {
                 const query = singer ? `${name} ${singer}` : name
                 let list: any[] = []
                 try {
-                    const searchRes: any = await (musicSdk as any)[trySource]?.musicSearch?.search?.(query, 1, 5)
+                    const remaining = resolveDeadline - Date.now()
+                    if (remaining <= 0) break sourceLoop
+                    const searchRes: any = await withTimeout(
+                        Promise.resolve((musicSdk as any)[trySource]?.musicSearch?.search?.(query, 1, 5)),
+                        Math.max(1000, remaining),
+                    )
                     list = searchRes?.list || []
                 } catch (e: any) {
                     if (cfg['subsonic.enableDebug']) subsonicLog.debug(`[Subsonic] quality-select crossPlatform ${source}->${trySource} search failed: ${e?.message || e}`)
                     continue
                 }
                 if (list.length === 0) continue
-                // 没有任何一条通过歌名/歌手校验时不得回退 list[0]，
+                // 严格挑选最佳匹配；没有任何一条通过校验时不得回退 list[0]，
                 // 否则会用不相干歌曲的 songmid 去解析播放地址，导致用户听到完全不同的歌。
-                const match = list.find((it: any) => this.matchSongAcrossSources(it, musicInfo))
+                const match = this.pickBestCrossSourceMatch(list, musicInfo)
                 if (!match) continue
                 const tSongmid = String(match?.songmid || match?.id || '')
                 if (!tSongmid) continue
-                candidates = [{
-                    music: {
-                        source: trySource,
-                        songmid: tSongmid,
-                        id: `${trySource}_${tSongmid}`,
-                        name: match.name,
-                        singer: match.singer,
-                        meta: { ...(match.meta || {}), songId: tSongmid },
-                    },
-                }]
+                candidates = [{ music: this.buildOnlineMusicInfo(trySource, match) }]
             }
 
             const order = this.getQualityPriorityOrder(trySource, maxBitrate)
             for (const cand of candidates) {
                 for (const q of order) {
-                    if (fallbackResult && Date.now() >= resolveDeadline) {
+                    if (Date.now() >= resolveDeadline) {
                         break sourceLoop
                     }
                     // 仅对明确失效的播放链接重新取链一次；取链异常由底层重试，探测超时保留回退。
@@ -6224,15 +6248,20 @@ class SubsonicHandler {
                     resolveCandidate:
                     while (attempt < maxAttempts) {
                         attempt++
+                        const remaining = resolveDeadline - Date.now()
+                        if (remaining <= 0) break sourceLoop
                         try {
-                            const r = await callUserApiGetMusicUrl(
-                                trySource as any, cand.music as any, q, username,
-                                undefined, autoSwitchCustom,
-                                excludeApiSources.length ? excludeApiSources : undefined,
+                            const r = await withTimeout(
+                                callUserApiGetMusicUrl(
+                                    trySource as any, cand.music as any, q, username,
+                                    undefined, autoSwitchCustom,
+                                    excludeApiSources.length ? excludeApiSources : undefined,
+                                ),
+                                Math.max(1500, remaining),
                             )
                             if (r?.url) {
-                                const remainingBudget = Math.max(600, resolveDeadline - Date.now())
-                                const probeTimeout = Math.min(2500, remainingBudget)
+                                const probeBudget = Math.max(600, resolveDeadline - Date.now())
+                                const probeTimeout = Math.min(2000, probeBudget)
 
                                 // 探测音频 URL 是否真实可读，避免返回 401 签名错误或 404 文件不存在的虚假链接
                                 const probeResult = await probeAudioUrl(r.url, probeTimeout)
@@ -6243,14 +6272,21 @@ class SubsonicHandler {
                                 if (probeResult === 'ok') {
                                     return { url: r.url, quality: r.type || q, selected }
                                 } else if (probeResult === 'timeout') {
-                                    // 区分探测超时与明确失效（401/404）：超时保留为候选回退，避免上游延迟导致整首歌误报错误
+                                    // 原平台已经按精确 songmid 成功取到播放链接，仅因服务端本机到上游 CDN 网络探测超时：
+                                    // 链接本身并未报错（非 401/403/404），直接信任并交付原平台直链，避免继续跨平台搜替身导致串歌或被 7s 试听覆盖。
+                                    if (trySource === source) {
+                                        if (cfg['subsonic.enableDebug']) {
+                                            subsonicLog.debug(`[Subsonic] original source URL probe timeout, returning direct URL: ${trySource} ${q} -> ${String(r.url).slice(0, 80)}`)
+                                        }
+                                        return { url: r.url, quality: r.type || q, selected }
+                                    }
+                                    // 跨平台候选探测超时：保留为 fallback，若预算已耗尽则不再继续探测其他源
                                     if (!fallbackResult) {
                                         fallbackResult = { url: r.url, quality: r.type || q, selected }
                                     }
                                     if (cfg['subsonic.enableDebug']) {
                                         subsonicLog.debug(`[Subsonic] candidate URL probe timeout (saved as fallback): ${trySource} ${q} -> ${String(r.url).slice(0, 80)}`)
                                     }
-                                    // 若时间预算已耗尽，不再继续串行探测其他源，直接返回该 fallback
                                     if (Date.now() >= resolveDeadline) {
                                         break sourceLoop
                                     }
@@ -6294,17 +6330,87 @@ class SubsonicHandler {
         throw new Error('Could not resolve music URL (all quality/source candidates failed)')
     }
 
-    /** 跨平台重锚时判断搜索结果是否匹配原曲：歌名归一化相等/包含 + 歌手部分匹配 */
+    /** 对跨平台搜索候选打分；不兼容返回 -1（严格防串歌：拒绝子串误命中、伴奏/Live 错版、歌手不符、时长差距过大） */
+    private scoreCrossSourceMatch(it: any, musicInfo: any): number {
+        const clean = (s: unknown) => toSimplified(String(s || '')).toLowerCase().trim()
+        const compact = (s: string) => clean(s).replace(/[\s\-_()（）【】\[\]、，,。.·'’"“”!?！？:：/]+/g, '')
+        const stripSubtitle = (s: string) => s
+            .replace(/\s*(?:[（(\[【][^）)\]】]*[）)\]】]|[-–—]\s*[^-–—]+)\s*$/g, '')
+            .trim()
+
+        const raw1 = clean(it?.name)
+        const raw2 = clean(musicInfo?.name)
+        const n1 = compact(raw1)
+        const n2 = compact(raw2)
+        if (!n1 || !n2) return -1
+
+        // 拒绝版本性质不符的替身（伴奏 / 纯音乐 / DJ / Remix / Live）
+        const instrumentalRe = /(?:伴奏|纯音乐|消音|卡拉ok|karaoke|instrumental|off\s*vocal|accompaniment|dj版?|remix)/i
+        const liveRe = /(?:live|现场)/i
+        if (!instrumentalRe.test(raw2) && instrumentalRe.test(raw1)) return -1
+        if (!liveRe.test(raw2) && liveRe.test(raw1)) return -1
+
+        let score = 0
+        if (n1 === n2) {
+            score += 100
+        } else {
+            const b1 = compact(stripSubtitle(raw1))
+            const b2 = compact(stripSubtitle(raw2))
+            const isSeparatorPrefixed = (longer: string, shorter: string) =>
+                longer.startsWith(shorter) && /^[\s(（\[【\-–—:：]/.test(longer.slice(shorter.length))
+            if (b1 && b2 && b1 === b2) {
+                score += 70
+            } else if (isSeparatorPrefixed(raw1, raw2) || isSeparatorPrefixed(raw2, raw1)) {
+                score += 60
+            } else {
+                return -1
+            }
+        }
+
+        // 歌手校验：原曲有歌手时，候选必须有歌手且至少匹配一位规范化歌手
+        const s1Raw = String(it?.singer || '').trim()
+        const s2Raw = String(musicInfo?.singer || '').trim()
+        if (s2Raw) {
+            if (!s1Raw) return -1
+            const tokens1 = splitSingers(s1Raw).map(compact).filter(Boolean)
+            const tokens2 = splitSingers(s2Raw).map(compact).filter(Boolean)
+            const exactOverlap = tokens1.some(a => tokens2.includes(a))
+            const partialOverlap = !exactOverlap && tokens1.some(a =>
+                tokens2.some(b => (a.length >= 2 && b.includes(a)) || (b.length >= 2 && a.includes(b))),
+            )
+            if (!exactOverlap && !partialOverlap) return -1
+            score += exactOverlap ? 40 : 15
+        }
+
+        // 时长校验：双方均有有效时长时，排除相差过大（如 7:12 画心 vs 4:42 其他歌曲）
+        const d1 = this.parseDuration(it?.interval)
+        const d2 = this.parseDuration(musicInfo?.interval)
+        if (d1 > 0 && d2 > 0) {
+            const diff = Math.abs(d1 - d2)
+            if (diff > Math.max(15, d2 * 0.2)) return -1
+            score += Math.max(0, 20 - Math.floor(diff / 2))
+        }
+
+        return score
+    }
+
+    private pickBestCrossSourceMatch(list: any[], musicInfo: any): any | null {
+        if (!Array.isArray(list) || list.length === 0) return null
+        let best: any = null
+        let bestScore = -1
+        for (const it of list) {
+            const s = this.scoreCrossSourceMatch(it, musicInfo)
+            if (s > bestScore) {
+                bestScore = s
+                best = it
+            }
+        }
+        return best
+    }
+
+    /** 跨平台重锚时判断搜索结果是否匹配原曲 */
     private matchSongAcrossSources(it: any, musicInfo: any): boolean {
-        const norm = (s: string) => String(s || '').toLowerCase().replace(/[\s\-_()（）【】\[\]、，,。.]/g, '')
-        const n1 = norm(it?.name)
-        const n2 = norm(musicInfo?.name)
-        if (!n1 || !n2) return false
-        if (n1 !== n2 && !n1.includes(n2) && !n2.includes(n1)) return false
-        const s1 = norm(it?.singer)
-        const s2 = norm(musicInfo?.singer)
-        if (s1 && s2 && !s1.includes(s2) && !s2.includes(s1)) return false
-        return true
+        return this.scoreCrossSourceMatch(it, musicInfo) >= 0
     }
 
     /**
@@ -6750,13 +6856,17 @@ class SubsonicHandler {
             if (source === 'kg' && !hash) {
                 try {
                     const title = musicInfo.name || params.get('title') || params.get('name') || songmid
-                    const searchRes = await musicSdk.kg.musicSearch.search(title, 1, 5)
-                    const match = searchRes?.list?.find((item: any) => String(item.songmid || item.id || item.Audioid) === songmid) || searchRes?.list?.[0]
+                    const singer = musicInfo.singer || params.get('artist') || params.get('singer') || ''
+                    const query = (musicInfo.name && singer) ? `${title} ${singer}` : title
+                    const searchRes = await withTimeout(Promise.resolve(musicSdk.kg.musicSearch.search(query, 1, 5)), 5000)
+                    const list = searchRes?.list || []
+                    const match = list.find((item: any) => String(item.songmid || item.id || item.Audioid) === songmid)
+                        || (musicInfo.name ? this.pickBestCrossSourceMatch(list, { ...musicInfo, singer }) : null)
                     if (match) {
                         hash = match.hash || match.meta?.hash || match.types?.[0]?.hash || ''
                     }
                 } catch (e) {
-                    this.logSourceError('kg-hash', `auto-resolve hash kw_${songmid}`, e)
+                    this.logSourceError('kg-hash', `auto-resolve hash kg_${songmid}`, e)
                 }
             }
 
