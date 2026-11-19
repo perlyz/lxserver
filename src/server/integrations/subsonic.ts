@@ -786,6 +786,41 @@ class SubsonicHandler {
     // key = `${source}_${songmid}_${maxBitrate}_${username}`，值生命周期与解析 Promise 相同。
     private resolveStreamInFlight = new Map<string, Promise<{ url: string, quality: string, selected?: string }>>()
 
+    // 在线歌词内存缓存 + In-flight 去重（id -> { expiresAt, lyric, tlyric }），减少重复回源延迟
+    private static readonly MAX_ONLINE_LYRIC_CACHE = 500
+    private static readonly ONLINE_LYRIC_CACHE_TTL_MS = 24 * 60 * 60 * 1000
+    private onlineLyricCache = new Map<string, { expiresAt: number, lyric: string, tlyric: string }>()
+    private onlineLyricInFlight = new Map<string, Promise<{ lyric: string, tlyric: string }>>()
+
+    private getOnlineLyricCached(id: string): { lyric: string, tlyric: string } | null {
+        const entry = this.onlineLyricCache.get(id)
+        if (!entry) return null
+        if (Date.now() >= entry.expiresAt) {
+            this.onlineLyricCache.delete(id)
+            return null
+        }
+        // 刷新 LRU 顺序
+        this.onlineLyricCache.delete(id)
+        this.onlineLyricCache.set(id, entry)
+        return { lyric: entry.lyric, tlyric: entry.tlyric }
+    }
+
+    private setOnlineLyricCache(id: string, lyricInfo: { lyric?: string, tlyric?: string } | null | undefined) {
+        const lyric = lyricInfo?.lyric || ''
+        if (!lyric.trim()) return
+        if (this.onlineLyricCache.has(id)) this.onlineLyricCache.delete(id)
+        while (this.onlineLyricCache.size >= SubsonicHandler.MAX_ONLINE_LYRIC_CACHE) {
+            const firstKey = this.onlineLyricCache.keys().next().value
+            if (firstKey === undefined) break
+            this.onlineLyricCache.delete(firstKey)
+        }
+        this.onlineLyricCache.set(id, {
+            expiresAt: Date.now() + SubsonicHandler.ONLINE_LYRIC_CACHE_TTL_MS,
+            lyric,
+            tlyric: lyricInfo?.tlyric || '',
+        })
+    }
+
     // 固定同一关键词的在线结果顺序，避免客户端翻页时出现重复或跳项。
     private onlineSearchCache = new Map<string, { expiresAt: number, results: { music: LX.Music.MusicInfo, listId: string }[] }>()
     private onlineArtistSearchCache = new Map<string, { expiresAt: number, results: any[] }>()
@@ -1109,7 +1144,7 @@ class SubsonicHandler {
         this.currentUsername = username
 
         // [starred] 预先计算当前用户 love 列表歌曲 id 集合，供歌曲序列化标记 starred（排除热路径方法）
-        if (!['ping', 'getLicense', 'stream', 'download', 'getCoverArt'].includes(method)) {
+        if (!['ping', 'getLicense', 'stream', 'download', 'getCoverArt', 'getLyrics', 'getLyricsBySongId'].includes(method)) {
             try {
                 const listData = await getUserSpace(username).listManage.getListData()
                 this.loveIdSets.set(username, new Set((listData.loveList || []).map((m: any) => m.id)))
@@ -7987,19 +8022,30 @@ class SubsonicHandler {
             return this.handleGetLyricsBySongId(res, username, params, format)
         }
 
-        // 尝试通过歌手和标题反查歌曲 ID
-        const userSpace = getUserSpace(username)
-        const listData = await this.getSubsonicListData(username)
-        const all: LX.Music.MusicInfo[] = [
-            ...listData.loveList,
-            ...listData.defaultList,
-            ...listData.userList.flatMap(l => (l.list || []) as LX.Music.MusicInfo[])
-        ]
+        // 尝试通过歌手和标题反查歌曲 ID（先查用户歌单，再回退到在线缓存）
+        const normTitle = title.trim().toLowerCase()
+        const normArtist = artist.trim().toLowerCase()
+        let found: LX.Music.MusicInfo | undefined
+        if (normTitle) {
+            const matches = (m: any) =>
+                (m?.name || '').trim().toLowerCase() === normTitle &&
+                (!normArtist || (m?.singer || '').toLowerCase().includes(normArtist))
 
-        const found = all.find(m =>
-            m.name.toLowerCase() === title.toLowerCase() &&
-            m.singer.toLowerCase().includes(artist.toLowerCase())
-        )
+            const listData = await this.getSubsonicListData(username)
+            const all: LX.Music.MusicInfo[] = [
+                ...listData.loveList,
+                ...listData.defaultList,
+                ...listData.userList.flatMap(l => (l.list || []) as LX.Music.MusicInfo[])
+            ]
+            found = all.find(matches)
+
+            if (!found) {
+                this.loadOnlineSongCache()
+                for (const m of this.onlineSongCache.values()) {
+                    if (matches(m)) found = m
+                }
+            }
+        }
 
         if (found) {
             params.set('id', found.id)
@@ -8101,9 +8147,12 @@ class SubsonicHandler {
         }
 
         try {
-            // 尝试查找歌曲详情以丰富歌词请求元数据 (KG/MG 特别需要)
-            const found = await this.findMusicById(username, id)
-            const musicMeta = found?.music || {
+            // 在线 ID 优先直接命中内存/磁盘缓存的歌曲元数据，避免无谓遍历全部歌单和本地曲库
+            const isLocal = typeof isLocalSong === 'function' ? isLocalSong(id) : id.startsWith('local_')
+            if (!isLocal) this.loadOnlineSongCache?.()
+            const cachedSong = !isLocal ? this.onlineSongCache?.get(id) : undefined
+            const foundMusic = cachedSong || (await this.findMusicById(username, id))?.music
+            const musicMeta = foundMusic || {
                 id,
                 source,
                 songmid,
@@ -8112,33 +8161,61 @@ class SubsonicHandler {
             } as any
 
             const localLyric = lookupLocalLyrics(musicMeta, username)
-            let hash = (musicMeta as any).hash || (musicMeta as any).meta?.hash || ''
-            if (!localLyric.exists && source === 'kg' && !hash) {
-                try {
-                    const title = musicMeta.name || params.get('title') || params.get('name') || songmid
-                    const searchRes = await musicSdk.kg.musicSearch.search(title, 1, 5)
-                    const match = searchRes?.list?.find((item: any) => String(item.songmid || item.id || item.Audioid) === songmid) || searchRes?.list?.[0]
-                    if (match) {
-                        hash = match.hash || match.meta?.hash || match.types?.[0]?.hash || ''
+            let lyricInfo: { lyric?: string, tlyric?: string }
+            if (localLyric.exists) {
+                lyricInfo = localLyric.content
+            } else {
+                const cachedLyric = this.getOnlineLyricCached?.(id) || null
+                if (cachedLyric) {
+                    lyricInfo = cachedLyric
+                } else {
+                    const fetchRemoteLyric = async () => {
+                        let hash = (musicMeta as any).hash || (musicMeta as any).meta?.hash || ''
+                        if (source === 'kg' && !hash) {
+                            try {
+                                const title = musicMeta.name || params.get('title') || params.get('name') || songmid
+                                const searchRes = await musicSdk.kg.musicSearch.search(title, 1, 5)
+                                const match = searchRes?.list?.find((item: any) => String(item.songmid || item.id || item.Audioid) === songmid) || searchRes?.list?.[0]
+                                if (match) {
+                                    hash = match.hash || match.meta?.hash || match.types?.[0]?.hash || ''
+                                }
+                            } catch (e) {
+                                subsonicLog.error('[Subsonic] Auto-resolve kg hash for lyric failed:', e)
+                            }
+                        }
+
+                        const songInfo = {
+                            songmid: (musicMeta as any).songmid || songmid,
+                            songId: (musicMeta as any).songId || (musicMeta as any).meta?.songId || undefined,
+                            name: musicMeta.name || '',
+                            singer: musicMeta.singer || '',
+                            hash: hash,
+                            interval: (musicMeta as any).interval || '',
+                            _interval: (musicMeta as any)._interval || (musicMeta as any).interval || '',
+                            copyrightId: (musicMeta as any).copyrightId || (musicMeta as any).meta?.copyrightId || '',
+                            albumId: (musicMeta as any).albumId || (musicMeta as any).meta?.albumId || '',
+                            lrcUrl: (musicMeta as any).lrcUrl || (musicMeta as any).meta?.lrcUrl || '',
+                        }
+
+                        const raw = await musicSdk[source].getLyric(songInfo).promise
+                        this.setOnlineLyricCache?.(id, raw)
+                        return { lyric: raw?.lyric || '', tlyric: raw?.tlyric || '' }
                     }
-                } catch (e) {
-                    subsonicLog.error('[Subsonic] Auto-resolve kg hash for lyric failed:', e)
+
+                    if (this.onlineLyricInFlight) {
+                        let flight = this.onlineLyricInFlight.get(id)
+                        if (!flight) {
+                            flight = fetchRemoteLyric().finally(() => {
+                                this.onlineLyricInFlight.delete(id)
+                            })
+                            this.onlineLyricInFlight.set(id, flight)
+                        }
+                        lyricInfo = await flight
+                    } else {
+                        lyricInfo = await fetchRemoteLyric()
+                    }
                 }
             }
-
-            const songInfo = {
-                songmid: (musicMeta as any).songmid || songmid,
-                name: musicMeta.name || '',
-                singer: musicMeta.singer || '',
-                hash: hash,
-                interval: (musicMeta as any).interval || '',
-                _interval: (musicMeta as any)._interval || (musicMeta as any).interval || '',
-                copyrightId: (musicMeta as any).copyrightId || (musicMeta as any).meta?.copyrightId || '',
-                albumId: (musicMeta as any).albumId || (musicMeta as any).meta?.albumId || '',
-                lrcUrl: (musicMeta as any).lrcUrl || (musicMeta as any).meta?.lrcUrl || '',
-            }
-
-            const lyricInfo = localLyric.exists ? localLyric.content : await musicSdk[source].getLyric(songInfo).promise
 
             const rawLrc = lyricInfo.lyric || ''
             const transLrc = lyricInfo.tlyric || ''
