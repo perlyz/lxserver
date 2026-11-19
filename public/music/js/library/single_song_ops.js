@@ -429,7 +429,7 @@ async function downloadSong(songOrId, forceQuality = null, suppressAlerts = fals
     }
 
     const isOnlyDownload = window.settings?.enableOnlyDownloadMode === true;
-    const actionLabel = isOnlyDownload ? '下载到服务器' : '缓存到服务器';
+    const actionLabel = '下载到服务器';
 
     let selected = skipPromptTarget;
     if (!selected) {
@@ -540,10 +540,11 @@ async function downloadSong(songOrId, forceQuality = null, suppressAlerts = fals
                     ...song,
                     taskId: 'server_' + (song.id || song.songmid),
                     isServer: true,
+                    saveToMusicDir: true,
                     quality: targetQuality,
                     explicitQuality: targetQuality
                 }]);
-                if (!suppressAlerts) showInfo(`已添加云端缓存任务`);
+                if (!suppressAlerts) showInfo(`已添加服务器下载任务`);
                 return true;
             } else {
                 showError('下载管理器未就绪');
@@ -566,7 +567,7 @@ async function batchDownloadSongs(songsToDownload, batchOptions = {}) {
 
     const clearSelection = batchOptions.clearSelection !== false;
     const selectionLabel = batchOptions.selectionLabel || `选择了 ${songsToDownload.length} 首歌曲`;
-    const targetOptions = ['浏览器下载', '缓存到服务器'];
+    const targetOptions = ['浏览器下载', '下载到服务器'];
     const modeText = window.settings?.['enableOnlyDownloadMode'] ? '仅下载模式' : '缓存模式';
     const selected = await showOptions('批量下载与缓存', `[${modeText}] ${selectionLabel}，请选择操作：`, targetOptions);
 
@@ -617,7 +618,7 @@ async function batchDownloadSongs(songsToDownload, batchOptions = {}) {
             showError('下载管理器未就绪');
             return false;
         }
-    } else if (selected === '缓存到服务器') {
+    } else if (selected === '下载到服务器' || selected === '缓存到服务器') {
         const isServerCacheAllowed = window.lx_config?.['user.enablePublicNonAdminServerCache'] !== false;
         if (isPublic && enablePublicRestriction && !isServerCacheAllowed && !isAdmin) {
             showError('权限限制：管理员已关闭非管理员服务器缓存功能，批量缓存需要验证管理员身份。');
@@ -632,7 +633,7 @@ async function batchDownloadSongs(songsToDownload, batchOptions = {}) {
         // 使用全局音质优先级展示可选音质
         const availableQualities = getSelectableQualityOrder();
         const qualityDisplayNames = availableQualities.map(q => window.QualityManager ? window.QualityManager.getQualityDisplayName(q) : q);
-        const selectedQualityDisplay = await showOptions('选择全局缓存音质', `请选择批量请求服务器缓存的音质，下载歌曲的音质将取不超过该音质的最大音质`, qualityDisplayNames);
+        const selectedQualityDisplay = await showOptions('选择全局下载音质', `请选择批量下载到服务器的音质，下载歌曲的音质将取不超过该音质的最大音质`, qualityDisplayNames);
 
         if (!selectedQualityDisplay) return false;
         const selectedQualityIndex = qualityDisplayNames.indexOf(selectedQualityDisplay);
@@ -649,6 +650,7 @@ async function batchDownloadSongs(songsToDownload, batchOptions = {}) {
                 ...s,
                 taskId: 'server_' + (s.id || s.songmid),
                 isServer: true,
+                saveToMusicDir: true,
                 quality: targetQuality,
                 explicitQuality: targetQuality
             };
@@ -659,7 +661,7 @@ async function batchDownloadSongs(songsToDownload, batchOptions = {}) {
             if (typeof exitBatchMode === 'function') exitBatchMode();
             else if (typeof deselectAll === 'function') deselectAll();
         }
-        showInfo(`已将 ${songsToDownload.length} 首歌曲加入缓存队列`);
+        showInfo(`已将 ${songsToDownload.length} 首歌曲加入服务器下载队列`);
         return true;
     }
 

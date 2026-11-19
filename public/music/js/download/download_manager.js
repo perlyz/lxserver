@@ -152,7 +152,7 @@ class DownloadManager {
                     id: task.id,
                     songInfo: this.getSongInfoForServer(task.song),
                     quality: task.quality,
-                    enableOnlyDownloadMode: window.settings?.enableOnlyDownloadMode || false,
+                    enableOnlyDownloadMode: Boolean(task.saveToMusicDir || window.settings?.enableOnlyDownloadMode),
                     cacheLyric: window.settings?.enableServerLyricCache !== false,
                     embedLyric: !!(window.settings?.embedLyricToFile ?? true)
                 }))
@@ -201,6 +201,7 @@ class DownloadManager {
                         id: item.id,
                         song: item.songInfo || {},
                         isServer: true,
+                        saveToMusicDir: !!item.enableOnlyDownloadMode,
                         serverManaged: true,
                         serverQueueRegistered: true,
                         serverQueueId: item.id,
@@ -331,7 +332,7 @@ class DownloadManager {
             task.status === 'finished' &&
             window.requestServerLyricCache &&
             window.settings?.enableServerLyricCache !== false &&
-            window.settings?.enableOnlyDownloadMode !== true
+            !(task.saveToMusicDir || window.settings?.enableOnlyDownloadMode === true)
         );
     }
 
@@ -733,8 +734,9 @@ class DownloadManager {
         const addedServerTasks = [];
         for (const { song, quality, cacheResult } of results) {
             const isServerTask = song.isServer || false;
+            const saveToMusicDir = Boolean(song.saveToMusicDir);
             if (cacheResult.exists && !cacheResult.isCollision) {
-                const onlyDownloadMode = window.settings?.enableOnlyDownloadMode === true;
+                const onlyDownloadMode = saveToMusicDir || window.settings?.enableOnlyDownloadMode === true;
                 const targetAlreadyExists = !onlyDownloadMode || cacheResult.folder === 'music';
                 if (isServerTask && targetAlreadyExists) { // 仅下载模式下 cache 命中仍需交给后端复制到 music 目录
                     skipCount++;
@@ -759,6 +761,7 @@ class DownloadManager {
                     id: taskId,
                     song: song,
                     isServer: isServerTask,
+                    saveToMusicDir,
                     serverManaged: isServerTask,
                     serverQueueRegistered: false,
                     serverQueueId: isServerTask ? taskId : null,
@@ -865,7 +868,7 @@ class DownloadManager {
                 requestedSource,
                 downloadSource: result.downloadSource || resolvedSong.source,
                 sourceName: result.sourceName || '',
-                enableOnlyDownloadMode: window.settings?.enableOnlyDownloadMode || false,
+                enableOnlyDownloadMode: Boolean(task.saveToMusicDir || window.settings?.enableOnlyDownloadMode),
                 cacheLyric: window.settings?.enableServerLyricCache !== false,
                 embedLyric: !!(window.settings?.embedLyricToFile ?? true)
             };
@@ -1408,6 +1411,7 @@ class DownloadManager {
                 id: t.id,
                 song: this.getSongInfoForStorage(t.song),
                 isServer: t.isServer,
+                saveToMusicDir: !!t.saveToMusicDir,
                 useNativeDownload: !!t.useNativeDownload,
                 nativeDownloadDispatched: !!t.nativeDownloadDispatched,
                 quality: t.quality,
@@ -1447,6 +1451,7 @@ class DownloadManager {
                     id: /^[A-Za-z0-9_-]+$/.test(String(t.id || '')) ? t.id : this.createTaskId(t.isServer ? 'server' : 'dl'),
                     song: t.song,
                     isServer: t.isServer || false,
+                    saveToMusicDir: !!t.saveToMusicDir,
                     // Migrate server tasks left by older versions without allowing
                     // the browser scheduler to start a duplicate download.
                     serverManaged: !!t.isServer,

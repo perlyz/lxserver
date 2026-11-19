@@ -17085,7 +17085,7 @@ async function handleDownloadClick(event) {
     const song = currentPlayingSong;
 
     const isOnlyDownload = window.settings?.enableOnlyDownloadMode === true;
-    const actionLabel = isOnlyDownload ? '下载到服务器' : '缓存到服务器';
+    const actionLabel = '下载到服务器';
     const options = ['浏览器下载', `${actionLabel}${await (window.describeServerStateSuffix?.(song) || '')}`];
     const modeText = isOnlyDownload ? '仅下载模式' : '缓存模式';
     const selected = await showOptions('下载与缓存', `[${modeText}] 选择对 [${song.name}] 的操作：`, options);
